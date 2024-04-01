@@ -10,7 +10,7 @@
 {%- endif -%}
 {%- set LOG_SIZE_LIMIT = salt['pillar.get']('elasticsearch:log_size_limit', '') -%}
 
-# Copyright 2014-2022 Security Onion Solutions, LLC
+# Copyright 2014-2023 Security Onion Solutions, LLC
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -29,7 +29,7 @@ LOG="/opt/so/log/curator/so-curator-closed-delete.log"
 
 overlimit() {
 
-        [[ $(du -hs --block-size=1GB /nsm/elasticsearch/nodes | awk '{print $1}' ) -gt "{{LOG_SIZE_LIMIT}}" ]]
+        [[ $(du -hs --block-size=1GB /nsm/elasticsearch/indices | awk '{print $1}' ) -gt "{{LOG_SIZE_LIMIT}}" ]]
 }
 
 closedindices() {

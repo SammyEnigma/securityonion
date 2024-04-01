@@ -38,15 +38,15 @@ socore:
 soconfperms:
   file.directory:
     - name: /opt/so/conf
-    - uid: 939
-    - gid: 939
+    - user: 939
+    - group: 939
     - dir_mode: 770
 
 sostatusconf:
   file.directory:
     - name: /opt/so/conf/so-status
-    - uid: 939
-    - gid: 939
+    - user: 939
+    - group: 939
     - dir_mode: 770
 
 so-status.conf:
@@ -57,8 +57,8 @@ so-status.conf:
 sosaltstackperms:
   file.directory:
     - name: /opt/so/saltstack
-    - uid: 939
-    - gid: 939
+    - user: 939
+    - group: 939
     - dir_mode: 770
 
 so_log_perms:
@@ -110,7 +110,6 @@ commonpkgs:
       - libssl-dev
       - python3-dateutil
       - python3-m2crypto
-      - python3-mysqldb
       - python3-packaging
       - python3-lxml
       - git
@@ -153,7 +152,6 @@ commonpkgs:
       - python36-docker
       - python36-dateutil
       - python36-m2crypto
-      - python36-mysql
       - python36-packaging
       - python36-lxml
       - yum-utils
@@ -170,6 +168,7 @@ heldpackages:
       - docker-ce: 3:20.10.5-3.el7
       - docker-ce-cli: 1:20.10.5-3.el7
       - docker-ce-rootless-extras: 20.10.5-3.el7
+      - python36-mysql: 1.3.12-2.el7
     - hold: True
     - update_holds: True
 {% endif %}

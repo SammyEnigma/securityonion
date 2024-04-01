@@ -1,4 +1,4 @@
-# Copyright 2014-2022 Security Onion Solutions, LLC
+# Copyright 2014-2023 Security Onion Solutions, LLC
 
 #    This program is free software: you can redistribute it and/or modify
 #    it under the terms of the GNU General Public License as published by
@@ -44,6 +44,13 @@ suricata:
     - home: /nsm/suricata
     - createhome: False
 
+socoregroupwithsuricata:
+  group.present:
+    - name: socore
+    - gid: 939
+    - addusers:
+      - suricata
+
 suridir:
   file.directory:
     - name: /opt/so/conf/suricata
@@ -68,6 +75,7 @@ suridatadir:
     - name: /nsm/suricata/extracted
     - user: 940
     - group: 939
+    - mode: 770
     - makedirs: True
 
 surirulesync:

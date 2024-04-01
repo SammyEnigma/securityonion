@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Copyright 2014-2022 Security Onion Solutions, LLC
+# Copyright 2014-2023 Security Onion Solutions, LLC
 
 #    This program is free software: you can redistribute it and/or modify
 #    it under the terms of the GNU General Public License as published by
@@ -17,9 +17,30 @@
 
 . /usr/sbin/so-common
 
+INSTALLEDVERSION=$(cat /etc/soversion)
+
+if [[ $INSTALLEDVERSION == "2.4.4" ]]; then
+
+  echo "Initiating supersoup mode"
+  mkdir -p /tmp/supersoup
+  cd /tmp/supersoup
+  echo "Updating soup..."
+  wget https://raw.githubusercontent.com/Security-Onion-Solutions/securityonion/2.4/main/salt/manager/tools/sbin/soup
+  cp soup /opt/so/saltstack/default/salt/manager/tools/sbin
+  echo "Updating soup..."
+  salt-call state.apply manager
+  echo "Please run soup a second time."
+
+  exit 0
+fi
+
+if [ "$INSTALLEDVERSION" = '2.4.3' ] || [ "$INSTALLEDVERSION" = '2.4.2' ] || [ "$INSTALLEDVERSION" = '2.4.1' ] || [ "$INSTALLEDVERSION" = '2.4.0' ]; then
+  echo "soup is not supported on $INSTALLEDVERSION. Please install the latest 2.4 release."
+  exit 1
+fi
+
 UPDATE_DIR=/tmp/sogh/securityonion
 DEFAULT_SALT_DIR=/opt/so/saltstack/default
-INSTALLEDVERSION=$(cat /etc/soversion)
 POSTVERSION=$INSTALLEDVERSION
 INSTALLEDSALTVERSION=$(salt --versions-report | grep Salt: | awk '{print $2}')
 BATCHSIZE=5
@@ -203,7 +224,7 @@ check_airgap() {
 
 check_local_mods() {
   local salt_local=/opt/so/saltstack/local
-
+  local_ignore_arr=("/opt/so/saltstack/local/salt/zeek/policy/intel/intel.dat")
   local_mod_arr=()
 
   while IFS= read -r -d '' local_file; do
@@ -211,8 +232,10 @@ check_local_mods() {
     default_file="${DEFAULT_SALT_DIR}${stripped_path}"
     if [[ -f $default_file ]]; then
       file_diff=$(diff "$default_file" "$local_file" )
-      if [[ $(echo "$file_diff" | grep -c "^<") -gt 0 ]]; then
-        local_mod_arr+=( "$local_file" )
+      if [[ ! " ${local_ignore_arr[*]} " =~ " ${local_file} " ]]; then
+        if [[ $(echo "$file_diff" | grep -Ec "^[<>]") -gt 0 ]]; then
+          local_mod_arr+=( "$local_file" )
+        fi
       fi
     fi
   done< <(find $salt_local -type f -print0)
@@ -223,11 +246,24 @@ check_local_mods() {
       echo "  $file_str"
     done
     echo ""
-    echo "To reference this list later, check $SOUP_LOG"
-    sleep 10
+    echo "To reference this list later, check $SOUP_LOG".
+    echo
+    if [[ -z $UNATTENDED ]] && ! [[ "${1}" == "skip-prompt" ]]; then
+      while true; do
+        read -p "Please review the local modifications shown above as they may cause problems during or after the update.
+
+Would you like to proceed with the update anyway?
+
+If so, type 'YES'. Otherwise, type anything else to exit SOUP. " yn
+
+        case $yn in
+          [yY][eE][sS] ) echo "Local modifications accepted.  Continuing..."; break;;
+          * ) exit 0;;
+        esac
+      done
+    fi
   fi
 }
-
 # {% endraw %}
 
 check_pillar_items() {
@@ -371,6 +407,81 @@ clone_to_tmp() {
   fi
 }
 
+elastalert_indices_check() {
+  echo "Checking Elastalert indices for compatibility..."
+  # Wait for ElasticSearch to initialize
+  echo -n "Waiting for ElasticSearch..."
+  COUNT=0
+  ELASTICSEARCH_CONNECTED="no"
+  while [[ "$COUNT" -le 240 ]]; do
+    so-elasticsearch-query / -k --output /dev/null
+      if [ $? -eq 0 ]; then
+        ELASTICSEARCH_CONNECTED="yes"
+        echo "connected!"
+          break
+      else
+        ((COUNT+=1))
+        sleep 1
+        echo -n "."
+      fi
+  done
+
+  # Unable to connect to Elasticsearch
+  if [ "$ELASTICSEARCH_CONNECTED" == "no" ]; then
+    echo
+    echo -e "Connection attempt timed out.  Unable to connect to ElasticSearch.  \nPlease try: \n  -checking log(s) in /var/log/elasticsearch/\n  -running 'sudo docker ps' \n  -running 'sudo so-elastic-restart'"
+    echo
+    exit 1
+  fi
+
+  MAJOR_ES_VERSION=$(so-elasticsearch-query / | jq -r .version.number | cut -d '.' -f1)
+  if [[ "$MAJOR_ES_VERSION" -lt "8" ]]; then
+
+    # Stop Elastalert to prevent Elastalert indices from being re-created
+    if grep -q "^so-elastalert$" /opt/so/conf/so-status/so-status.conf ; then
+      so-elastalert-stop || true
+    fi
+
+    # Check Elastalert indices
+    echo "Deleting Elastalert indices to prevent issues with upgrade to Elastic 8..."
+    CHECK_COUNT=0
+    while [[ "$CHECK_COUNT" -le 2 ]]; do
+      # Delete Elastalert indices
+      for i in $(so-elasticsearch-query _cat/indices | grep elastalert | awk '{print $3}'); do
+        so-elasticsearch-query $i -XDELETE;
+         done
+
+      # Check to ensure Elastalert indices are deleted
+      COUNT=0
+      ELASTALERT_INDICES_DELETED="no"
+      while [[ "$COUNT" -le 240 ]]; do
+        RESPONSE=$(so-elasticsearch-query "elastalert*")
+        if [[ "$RESPONSE" == "{}" ]]; then
+          ELASTALERT_INDICES_DELETED="yes"
+          break
+        else
+          ((COUNT+=1))
+          sleep 1
+          echo -n "."
+        fi
+      done
+      ((CHECK_COUNT+=1))
+    done
+
+    # If we were unable to delete the Elastalert indices, exit the script
+    if [ "$ELASTALERT_INDICES_DELETED" == "yes" ]; then
+      echo "Elastalert indices successfully deleted."
+    else
+      echo
+      echo -e "Unable to connect to delete Elastalert indices. Exiting."
+      echo
+      exit 1
+    fi
+  else
+    echo "Major Elasticsearch version is 8 or greater...skipping Elastalert index maintenance."
+  fi
+}
+
 enable_highstate() {
     echo "Enabling highstate."
     salt-call state.enable highstate -l info --local
@@ -380,7 +491,7 @@ enable_highstate() {
 es_version_check() {
     CHECK_ES=$(echo $INSTALLEDVERSION | awk -F. '{print $3}')
   
-    if [ "$CHECK_ES" -lt "110" ]; then
+    if [[ "$CHECK_ES" -lt "110" ]]; then
       echo "You are currently running Security Onion $INSTALLEDVERSION. You will need to update to version 2.3.130 before updating to 2.3.140 or higher."
       echo ""
       echo "If your deployment has Internet access, you can use the following command to update to 2.3.130:"
@@ -454,6 +565,25 @@ preupgrade_changes() {
     [[ "$INSTALLEDVERSION" == 2.3.110 ]] && up_to_2.3.120
     [[ "$INSTALLEDVERSION" == 2.3.120 ]] && up_to_2.3.130
     [[ "$INSTALLEDVERSION" == 2.3.130 ]] && up_to_2.3.140
+    [[ "$INSTALLEDVERSION" == 2.3.140 ]] && up_to_2.3.150
+    [[ "$INSTALLEDVERSION" == 2.3.150 ]] && up_to_2.3.160
+    [[ "$INSTALLEDVERSION" == 2.3.160 ]] && up_to_2.3.170
+    [[ "$INSTALLEDVERSION" == 2.3.170 ]] && up_to_2.3.180
+    [[ "$INSTALLEDVERSION" == 2.3.180 ]] && up_to_2.3.181
+    [[ "$INSTALLEDVERSION" == 2.3.181 ]] && up_to_2.3.182
+    [[ "$INSTALLEDVERSION" == 2.3.182 ]] && up_to_2.3.190
+    [[ "$INSTALLEDVERSION" == 2.3.190 ]] && up_to_2.3.200
+    [[ "$INSTALLEDVERSION" == 2.3.200 ]] && up_to_2.3.210
+    [[ "$INSTALLEDVERSION" == 2.3.210 ]] && up_to_2.3.220
+    [[ "$INSTALLEDVERSION" == 2.3.220 ]] && up_to_2.3.230
+    [[ "$INSTALLEDVERSION" == 2.3.230 ]] && up_to_2.3.240
+    [[ "$INSTALLEDVERSION" == 2.3.240 ]] && up_to_2.3.250
+    [[ "$INSTALLEDVERSION" == 2.3.250 ]] && up_to_2.3.260
+    [[ "$INSTALLEDVERSION" == 2.3.260 ]] && up_to_2.3.270
+    [[ "$INSTALLEDVERSION" == 2.3.270 ]] && up_to_2.3.280
+    [[ "$INSTALLEDVERSION" == 2.3.280 ]] && up_to_2.3.290
+    [[ "$INSTALLEDVERSION" == 2.3.290 ]] && up_to_2.3.300
+    
     true
 }
 
@@ -470,7 +600,24 @@ postupgrade_changes() {
     [[ "$POSTVERSION" == 2.3.110 ]] && post_to_2.3.120
     [[ "$POSTVERSION" == 2.3.120 ]] && post_to_2.3.130
     [[ "$POSTVERSION" == 2.3.130 ]] && post_to_2.3.140
-    
+    [[ "$POSTVERSION" == 2.3.140 ]] && post_to_2.3.150
+    [[ "$POSTVERSION" == 2.3.150 ]] && post_to_2.3.160
+    [[ "$POSTVERSION" == 2.3.160 ]] && post_to_2.3.170
+    [[ "$POSTVERSION" == 2.3.170 ]] && post_to_2.3.180
+    [[ "$POSTVERSION" == 2.3.180 ]] && post_to_2.3.181
+    [[ "$POSTVERSION" == 2.3.181 ]] && post_to_2.3.182
+    [[ "$POSTVERSION" == 2.3.182 ]] && post_to_2.3.190
+    [[ "$POSTVERSION" == 2.3.190 ]] && post_to_2.3.200
+    [[ "$POSTVERSION" == 2.3.200 ]] && post_to_2.3.210
+    [[ "$POSTVERSION" == 2.3.210 ]] && post_to_2.3.220
+    [[ "$POSTVERSION" == 2.3.220 ]] && post_to_2.3.230
+    [[ "$POSTVERSION" == 2.3.230 ]] && post_to_2.3.240
+    [[ "$POSTVERSION" == 2.3.240 ]] && post_to_2.3.250
+    [[ "$POSTVERSION" == 2.3.250 ]] && post_to_2.3.260
+    [[ "$POSTVERSION" == 2.3.260 ]] && post_to_2.3.270
+    [[ "$POSTVERSION" == 2.3.270 ]] && post_to_2.3.280
+    [[ "$POSTVERSION" == 2.3.280 ]] && post_to_2.3.290
+    [[ "$POSTVERSION" == 2.3.290 ]] && post_to_2.3.300
 
     true
 }
@@ -554,7 +701,102 @@ post_to_2.3.140() {
   POSTVERSION=2.3.140
 }
 
+post_to_2.3.150() {
+  echo "Nothing to do for .150"
+  POSTVERSION=2.3.150
+}
 
+post_to_2.3.160() {
+  echo "Nothing to do for .160"
+  POSTVERSION=2.3.160
+}
+
+post_to_2.3.170() {
+  echo "Nothing to do for .170"
+  POSTVERSION=2.3.170
+}
+
+post_to_2.3.180() {
+  echo "Nothing to do for .180"
+  POSTVERSION=2.3.180
+}
+
+post_to_2.3.181() {
+  echo "Nothing to do for .181"
+  POSTVERSION=2.3.181
+}
+
+post_to_2.3.182() {
+  echo "Nothing to do for .182"
+  POSTVERSION=2.3.182
+}
+
+post_to_2.3.190() {
+  echo "Nothing to do for .190"
+  POSTVERSION=2.3.190
+}
+
+post_to_2.3.200() {
+  echo "Nothing to do for .200"
+  POSTVERSION=2.3.200
+}
+
+post_to_2.3.210() {
+  echo "Nothing to do for .210"
+  POSTVERSION=2.3.210
+}
+
+post_to_2.3.220() {
+  echo "Nothing to do for .220"
+  POSTVERSION=2.3.220
+}
+
+post_to_2.3.230() {
+  echo "Nothing to do for .230"
+  POSTVERSION=2.3.230
+}
+
+post_to_2.3.240() {
+  echo "Nothing to do for .240"
+  POSTVERSION=2.3.240
+}
+
+post_to_2.3.250() {
+  echo "Nothing to do for .250"
+  POSTVERSION=2.3.250
+}
+
+post_to_2.3.260() {
+  echo "Nothing to do for .260"
+  POSTVERSION=2.3.260
+}
+
+post_to_2.3.270() {
+  echo "Pruning unused docker volumes on all nodes - This process will run in the background."
+  salt --async \* cmd.run "docker volume prune -f"
+
+  POSTVERSION=2.3.270
+}
+
+post_to_2.3.280() {
+  salt-call state.apply ca queue=True
+  stop_salt_minion
+  mv /etc/pki/managerssl.crt /etc/pki/managerssl.crt.old
+  mv /etc/pki/managerssl.key /etc/pki/managerssl.key.old
+  systemctl_func "start" "salt-minion"
+  enable_highstate
+  POSTVERSION=2.3.280
+}
+
+post_to_2.3.290() {
+  echo "Nothing to do for .290"
+  POSTVERSION=2.3.290
+}
+
+post_to_2.3.300() {
+  echo "Nothing to do for .300"
+  POSTVERSION=2.3.300
+}
 
 stop_salt_master() {
     # kill all salt jobs across the grid because the hang indefinitely if they are queued and salt-master restarts
@@ -812,9 +1054,9 @@ up_to_2.3.110() {
 
 up_to_2.3.120() {
   # Stop thehive services since these will be broken in .120
-  so-thehive-stop
-  so-thehive-es-stop
-  so-cortex-stop
+  so-thehive-stop || true
+  so-thehive-es-stop || true
+  so-cortex-stop || true
   INSTALLEDVERSION=2.3.120
 }
 
@@ -825,42 +1067,115 @@ up_to_2.3.130() {
 }
 
 up_to_2.3.140() {
-  ## Deleting Elastalert indices to prevent issues with upgrade to Elastic 8 ##
-  echo "Deleting Elastalert indices to prevent issues with upgrade to Elastic 8..."
-  # Wait for ElasticSearch to initialize
-  echo -n "Waiting for ElasticSearch..."
-  COUNT=0
-  ELASTICSEARCH_CONNECTED="no" 
-  while [[ "$COUNT" -le 240 ]]; do
-    so-elasticsearch-query / -k --output /dev/null
-      if [ $? -eq 0 ]; then
-        ELASTICSEARCH_CONNECTED="yes"
-        echo "connected!"
-          break
-      else
-        ((COUNT+=1))
-        sleep 1
-        echo -n "."
-      fi
-  done
-  if [ "$ELASTICSEARCH_CONNECTED" == "no" ]; then
-    echo
-    echo -e "Connection attempt timed out.  Unable to connect to ElasticSearch.  \nPlease try: \n  -checking log(s) in /var/log/elasticsearch/\n  -running 'sudo docker ps' \n  -running 'sudo so-elastic-restart'"
-    echo
-    exit 1
-   fi
-   
-   # Delete Elastalert indices
-   for i in $(so-elasticsearch-query _cat/indices | grep elastalert | awk '{print $3}'); do so-elasticsearch-query $i -XDELETE; done
-   # Check to ensure Elastalert indices have been deleted
-   RESPONSE=$(so-elasticsearch-query elastalert*)
-   if [[ "$RESPONSE" == "{}" ]]; then
-     echo "Elastalert indices have been deleted."
-   else
-     fail "Something went wrong. Could not delete the Elastalert indices. Exiting."
-   fi
+   elastalert_indices_check
    ##
    INSTALLEDVERSION=2.3.140
+}
+
+up_to_2.3.150() {
+  echo "Upgrading to 2.3.150"
+  INSTALLEDVERSION=2.3.150
+}
+
+up_to_2.3.160() {
+  echo "Upgrading to 2.3.160"
+  INSTALLEDVERSION=2.3.160
+}
+
+up_to_2.3.170() {
+  echo "Upgrading to 2.3.170"
+  INSTALLEDVERSION=2.3.170
+}
+
+up_to_2.3.180() {
+  echo "Upgrading to 2.3.180"
+  INSTALLEDVERSION=2.3.180
+}
+
+up_to_2.3.181() {
+  echo "Upgrading to 2.3.181"
+  INSTALLEDVERSION=2.3.181
+}
+
+up_to_2.3.182() {
+  echo "Upgrading to 2.3.182"
+  INSTALLEDVERSION=2.3.182
+}
+
+up_to_2.3.190() {
+  echo "Upgrading to 2.3.190"
+  if [ -d /nsm/zeek/extracted/complete ]; then
+    chown -R zeek:socore /nsm/zeek/extracted/complete
+    chmod 770 /nsm/zeek/extracted/complete
+  fi
+  INSTALLEDVERSION=2.3.190
+}
+
+up_to_2.3.200() {
+  echo "Upgrading to 2.3.200"
+  if [ ! -d /nsm/kratos ]; then
+    mkdir /nsm/kratos
+    chown -R kratos:kratos /nsm/kratos
+    chmod 700 /nsm/kratos
+  fi
+  if [ ! -d /nsm/kratos/db ]; then
+    echo "Moving Kratos DB to /nsm partition..."
+    mv /opt/so/conf/kratos/db /nsm/kratos/
+    echo "Move completed successfully"
+  else
+    echo "WARNING: /nsm/kratos/db already exists. This is unexpected and could result in SOC users no longer being able to login."
+  fi
+  INSTALLEDVERSION=2.3.200
+}
+
+up_to_2.3.210() {
+  echo "Upgrading to 2.3.210"
+  INSTALLEDVERSION=2.3.210
+}
+
+up_to_2.3.220() {
+  echo "Upgrading to 2.3.220"
+  INSTALLEDVERSION=2.3.220
+}
+
+up_to_2.3.230() {
+  echo "Upgrading to 2.3.230"
+  INSTALLEDVERSION=2.3.230
+}
+
+up_to_2.3.240() {
+  echo "Upgrading to 2.3.240"
+  INSTALLEDVERSION=2.3.240
+}
+
+up_to_2.3.250() {
+  echo "Upgrading to 2.3.250"
+  INSTALLEDVERSION=2.3.250
+}
+
+up_to_2.3.260() {
+  echo "Upgrading to 2.3.260"
+  INSTALLEDVERSION=2.3.260
+}
+
+up_to_2.3.270() {
+  echo "Upgrading to 2.3.270"
+  INSTALLEDVERSION=2.3.270
+}
+
+up_to_2.3.280() {
+  echo "Upgrading to 2.3.280"
+  INSTALLEDVERSION=2.3.280
+}
+
+up_to_2.3.290() {
+  echo "Upgrading to 2.3.290"
+  INSTALLEDVERSION=2.3.290
+}
+
+up_to_2.3.300() {
+  echo "Upgrading to 2.3.300"
+  INSTALLEDVERSION=2.3.300
 }
 
 verify_upgradespace() {
@@ -1060,14 +1375,14 @@ verify_latest_update_script() {
   if [[ "$CURRENTSOUP" == "$GITSOUP" && "$CURRENTCMN" == "$GITCMN" && "$CURRENTIMGCMN" == "$GITIMGCMN" && "$CURRENTSOFIREWALL" == "$GITSOFIREWALL" ]]; then
     echo "This version of the soup script is up to date. Proceeding."
   else
-    echo "You are not running the latest soup version. Updating soup and its components. Might take multiple runs to complete"
+    echo "You are not running the latest soup version. Updating soup and its components. This might take multiple runs to complete."
     cp $UPDATE_DIR/salt/common/tools/sbin/soup $DEFAULT_SALT_DIR/salt/common/tools/sbin/
     cp $UPDATE_DIR/salt/common/tools/sbin/so-common $DEFAULT_SALT_DIR/salt/common/tools/sbin/
     cp $UPDATE_DIR/salt/common/tools/sbin/so-image-common $DEFAULT_SALT_DIR/salt/common/tools/sbin/
     cp $UPDATE_DIR/salt/common/tools/sbin/so-firewall $DEFAULT_SALT_DIR/salt/common/tools/sbin/
     salt-call state.apply common.soup_scripts queue=True -linfo --file-root=$UPDATE_DIR/salt --local
     echo ""
-    echo "soup has been updated. Please run soup again."
+    echo "The soup script has been modified. Please run soup again to continue the upgrade."
     exit 0
   fi
 }
@@ -1178,10 +1493,12 @@ main() {
   verify_latest_update_script
   es_version_check
   es_indices_check
+  elastalert_indices_check
   echo ""
   set_palette
   check_elastic_license
   echo ""
+  check_local_mods
   check_os_updates
 
   echo "Generating new repo archive"
@@ -1346,7 +1663,7 @@ main() {
     fi
 
     echo "Checking for local modifications."
-    check_local_mods
+    check_local_mods skip-prompt
 
     echo "Checking sudoers file."
     check_sudoers
@@ -1444,8 +1761,12 @@ if [[ -z $UNATTENDED ]]; then
 
 SOUP - Security Onion UPdater
 
+**WARNING** Security Onion 2.3 reaches End Of Life (EOL) on April 6, 2024.
+Please make plans to migrate to Security Onion 2.4:
+https://blog.securityonion.net/2023/10/6-month-eol-notice-for-security-onion-23.html
+
 Please review the following for more information about the update process and recent updates:
-https://docs.securityonion.net/soup
+https://docs.securityonion.net/en/2.3/soup.html
 https://blog.securityonion.net
 
 EOF

@@ -1,4 +1,4 @@
-# Copyright 2014-2022 Security Onion Solutions, LLC
+# Copyright 2014-2023 Security Onion Solutions, LLC
 
 #    This program is free software: you can redistribute it and/or modify
 #    it under the terms of the GNU General Public License as published by
@@ -70,12 +70,15 @@ zeekextractdir:
     - name: /nsm/zeek/extracted
     - user: 937
     - group: 939
+    - mode: 770
     - makedirs: True
 
 zeekextractcompletedir:
   file.directory:
     - name: /nsm/zeek/extracted/complete
     - user: 937
+    - group: 939
+    - mode: 770
     - makedirs: True
 
 # Sync the policies
